@@ -1,0 +1,7 @@
+streamlit>=1.30
+simpy>=4.1
+scipy>=1.11
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.7
+fitter>=1.7

@@ -124,19 +124,42 @@ class AidStationConfig:
     mile: float
     servers:             int   = 6
     porta_johns:         int   = 4
-    trash_capacity:      int   = 400          # # discrete items before overflow
-    water_cups:          int   = 4000
-    electrolyte_cups:    int   = 2500
-    snacks:              int   = 3500
-    # Per-runner means
-    p_uses_porta_john:           float = 0.10
-    porta_john_service_mean_min: float = 1.8
-    porta_john_service_std_min:  float = 0.7
+    trash_capacity:      int   = 7000
+    # === Supply: continuous prep model ===
+    # Volunteers can't pre-pour thousands of cups. They start with a small buffer
+    # and continuously prepare cups; the buffer is capped (a table can only hold
+    # so many cups). When prep can't keep up with demand, buffer hits zero and
+    # runners are turned away (stockout).
+    water_ready_init:        int   = 80         # cups ready at race start
+    water_buffer_capacity:   int   = 200        # max cups on table at once
+    water_prep_per_min:      float = 250.0      # cups poured per minute by prep team
+    electrolyte_ready_init:  int   = 50
+    electrolyte_buffer_cap:  int   = 150
+    electrolyte_prep_per_min: float = 80.0
+    snacks_ready_init:       int   = 60
+    snacks_buffer_cap:       int   = 180
+    snacks_prep_per_min:     float = 100.0
+    # === Per-runner consumption ===
     cups_water_per_runner:       float = 1.2
     cups_electrolyte_per_runner: float = 0.5
     snacks_per_runner:           float = 0.5
     trash_per_runner:            float = 1.5
-    refill_water_per_min:        float = 100.0   # continuous; replace w/ truck arrivals later
+    # === Porta-john usage (corral-aware) ===
+    p_uses_porta_john_elite:     float = 0.04   # corral 0 (fastest 1/3)
+    p_uses_porta_john_other:     float = 0.10
+    porta_john_service_mean_min: float = 1.8
+    porta_john_service_std_min:  float = 0.7
+    # === Aid-line balking / reneging ===
+    # Most runners won't wait at an aid station. If they see ANY queue, they
+    # are very likely to skip. If they DO join, patience is short.
+    aid_balk_queue_threshold:    int   = 3      # 3+ in queue triggers high-prob balk
+    aid_balk_prob_at_threshold:  float = 0.90
+    aid_patience_mean_sec:       float = 25.0   # how long they'll wait before leaving
+    aid_patience_std_sec:        float = 12.0
+    # === Porta-john balking / reneging ===
+    porta_balk_prob_when_full:   float = 0.50   # 50% balk if all porta-johns busy
+    porta_patience_mean_min:     float = 1.5    # mean patience (matches "25% renege at 1min")
+    porta_patience_std_min:      float = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +292,11 @@ class RaceMetrics:
     first_bus_at_start:   dict = field(default_factory=dict)   # stop -> arrival time
     last_bus_at_start:    dict = field(default_factory=dict)   # stop -> arrival time
     injury_events:        list = field(default_factory=list)   # (t, mile, severity)
+    # Balking and reneging tracking
+    aid_balked:           list = field(default_factory=list)   # (mile, t)
+    aid_reneged:          list = field(default_factory=list)   # (mile, t, wait_min)
+    porta_balked:         list = field(default_factory=list)   # (mile_or_'start', t)
+    porta_reneged:        list = field(default_factory=list)   # (mile_or_'start', t, wait_min)
 
 
 # ---------------------------------------------------------------------------
@@ -281,22 +309,30 @@ class AidStation:
         self.metrics = metrics
         self.servers     = simpy.Resource(env, capacity=cfg.servers)
         self.porta_johns = simpy.Resource(env, capacity=cfg.porta_johns)
-        self.water       = simpy.Container(env, init=cfg.water_cups,
-                                           capacity=cfg.water_cups + 20000)
-        self.electrolyte = simpy.Container(env, init=cfg.electrolyte_cups,
-                                           capacity=cfg.electrolyte_cups + 20000)
-        self.snacks      = simpy.Container(env, init=cfg.snacks,
-                                           capacity=cfg.snacks + 20000)
+        # Continuous-prep model: small initial buffer, capped capacity, continuous refill.
+        self.water       = simpy.Container(env, init=cfg.water_ready_init,
+                                           capacity=cfg.water_buffer_capacity)
+        self.electrolyte = simpy.Container(env, init=cfg.electrolyte_ready_init,
+                                           capacity=cfg.electrolyte_buffer_cap)
+        self.snacks      = simpy.Container(env, init=cfg.snacks_ready_init,
+                                           capacity=cfg.snacks_buffer_cap)
         self._trash_level = 0
-        env.process(self._refill_water())
+        # Volunteers arrive ~15 min before race start and begin prepping.
+        env.process(self._prep_loop(self.water,       cfg.water_prep_per_min))
+        env.process(self._prep_loop(self.electrolyte, cfg.electrolyte_prep_per_min))
+        env.process(self._prep_loop(self.snacks,      cfg.snacks_prep_per_min))
 
-    def _refill_water(self):
+    def _prep_loop(self, container, prep_per_min, start_at=-15.0):
+        """Continuously add to container at prep_per_min rate (clamped by buffer cap)."""
+        if self.env.now < start_at:
+            yield self.env.timeout(start_at - self.env.now)
+        interval = 0.1                            # add a small amount every 6 sec
+        add_per_tick = prep_per_min * interval
         while True:
-            yield self.env.timeout(1.0)
-            add = min(self.cfg.refill_water_per_min,
-                      self.water.capacity - self.water.level)
-            if add > 0:
-                self.water.put(add)
+            yield self.env.timeout(interval)
+            room = container.capacity - container.level
+            if room > 0:
+                container.put(min(add_per_tick, room))
 
     def _add_trash(self, amt: int):
         before, after = self._trash_level, self._trash_level + amt
@@ -304,46 +340,71 @@ class AidStation:
             self.metrics.trash_overflows.append((self.cfg.mile, self.env.now))
         self._trash_level = after
 
-    def visit(self, bib, rng):
-        t_arrive = self.env.now
+    def visit(self, bib, rng, is_elite: bool = False):
         m = self.cfg.mile
         if m not in self.metrics.first_at_station:
-            self.metrics.first_at_station[m] = t_arrive
-        self.metrics.last_at_station[m] = t_arrive
+            self.metrics.first_at_station[m] = self.env.now
+        self.metrics.last_at_station[m] = self.env.now
 
-        # ----- aid line -----
-        with self.servers.request() as req:
-            yield req
-            self.metrics.aid_wait_min.append(self.env.now - t_arrive)
+        # ============ AID LINE: balk -> renege -> serve ============
+        qlen = len(self.servers.queue)
+        if qlen >= self.cfg.aid_balk_queue_threshold and \
+           rng.random() < self.cfg.aid_balk_prob_at_threshold:
+            self.metrics.aid_balked.append((m, self.env.now))
+        else:
+            t_arrive = self.env.now
+            patience_sec = max(1.0, rng.normal(self.cfg.aid_patience_mean_sec,
+                                               self.cfg.aid_patience_std_sec))
+            patience_min = patience_sec / 60.0
+            req = self.servers.request()
+            result = yield req | self.env.timeout(patience_min)
+            if req in result:
+                self.metrics.aid_wait_min.append(self.env.now - t_arrive)
+                for cont, mean, label in [
+                    (self.water,       self.cfg.cups_water_per_runner,       "water"),
+                    (self.electrolyte, self.cfg.cups_electrolyte_per_runner, "electrolyte"),
+                    (self.snacks,      self.cfg.snacks_per_runner,           "snack"),
+                ]:
+                    want = int(rng.poisson(mean))
+                    if want <= 0:
+                        continue
+                    if cont.level >= want:
+                        yield cont.get(want)
+                    else:
+                        self.metrics.stockouts.append((m, label, self.env.now))
+                self._add_trash(int(rng.poisson(self.cfg.trash_per_runner)))
+                yield self.env.timeout(rng.uniform(0.017, 0.067))    # ~1-4 sec handoff
+                self.servers.release(req)
+            else:
+                req.cancel()
+                self.metrics.aid_reneged.append((m, self.env.now,
+                                                  self.env.now - t_arrive))
 
-            for cont, mean, label in [
-                (self.water,       self.cfg.cups_water_per_runner,       "water"),
-                (self.electrolyte, self.cfg.cups_electrolyte_per_runner, "electrolyte"),
-                (self.snacks,      self.cfg.snacks_per_runner,           "snack"),
-            ]:
-                want = int(rng.poisson(mean))
-                if want <= 0:
-                    continue
-                if cont.level >= want:
-                    yield cont.get(want)
+        # ============ PORTA-JOHN LINE: corral-aware use prob, balk, renege ============
+        p_use = (self.cfg.p_uses_porta_john_elite if is_elite
+                 else self.cfg.p_uses_porta_john_other)
+        if rng.random() < p_use:
+            qlen_pj = len(self.porta_johns.queue)
+            # "Full" = at least as many waiting as units (all are busy with queue)
+            all_busy = self.porta_johns.count >= self.porta_johns.capacity
+            if all_busy and rng.random() < self.cfg.porta_balk_prob_when_full:
+                self.metrics.porta_balked.append((m, self.env.now))
+            else:
+                t_pj = self.env.now
+                patience = max(0.05, rng.normal(self.cfg.porta_patience_mean_min,
+                                                self.cfg.porta_patience_std_min))
+                req_pj = self.porta_johns.request()
+                result_pj = yield req_pj | self.env.timeout(patience)
+                if req_pj in result_pj:
+                    self.metrics.porta_wait_min.append(self.env.now - t_pj)
+                    yield self.env.timeout(_lognormal(rng,
+                                                       self.cfg.porta_john_service_mean_min,
+                                                       self.cfg.porta_john_service_std_min))
+                    self.porta_johns.release(req_pj)
                 else:
-                    self.metrics.stockouts.append((self.cfg.mile, label, self.env.now))
-
-            self._add_trash(int(rng.poisson(self.cfg.trash_per_runner)))
-
-            # Realistic aid-station handoff: ~1-4 sec (volunteer hands cup, runner grabs and goes).
-            # Was 8-15 sec previously which conflated handoff with consumption.
-            yield self.env.timeout(rng.uniform(0.017, 0.067))
-
-        # ----- porta-johns (stochastic) -----
-        if rng.random() < self.cfg.p_uses_porta_john:
-            t_pj = self.env.now
-            with self.porta_johns.request() as req:
-                yield req
-                self.metrics.porta_wait_min.append(self.env.now - t_pj)
-                yield self.env.timeout(_lognormal(rng,
-                                                  self.cfg.porta_john_service_mean_min,
-                                                  self.cfg.porta_john_service_std_min))
+                    req_pj.cancel()
+                    self.metrics.porta_reneged.append((m, self.env.now,
+                                                        self.env.now - t_pj))
 
 
 # ---------------------------------------------------------------------------
@@ -656,11 +717,16 @@ DEFAULT_BUS_STOPS = (
 @dataclass
 class StartAreaConfig:
     porta_johns:            int   = 120
-    p_use_before_race:      float = 0.85
+    p_use_before_race:      float = 0.85       # non-elite porta-john use probability
+    p_use_elite:            float = 0.60       # elite (corral 0) use less
     use_time_mean_min:      float = 1.5
     use_time_std_min:       float = 0.6
-    use_window_start_min:   float = -60    # earliest a runner targets the porta-john
-    use_window_end_min:     float = -5     # latest
+    use_window_start_min:   float = -60        # earliest a runner targets the porta-john
+    use_window_end_min:     float = -5         # latest
+    # Balking / reneging
+    balk_prob_when_full:    float = 0.50       # 50% balk if all porta-johns busy
+    patience_mean_min:      float = 1.5        # mean wait tolerance
+    patience_std_min:       float = 0.7        # ~25% renege at 1 min
 
 
 class BusStop:
@@ -708,25 +774,45 @@ class StartArea:
         self.metrics = metrics
         self.porta_johns = simpy.Resource(env, capacity=cfg.porta_johns)
 
-    def maybe_use(self, bib, rng):
-        if rng.random() > self.cfg.p_use_before_race:
+    def maybe_use(self, bib, rng, is_elite: bool = False):
+        # Elite runners use start-area porta-johns much less (less anxiety, better
+        # discipline, often arrive later and warm up instead).
+        p_use = (self.cfg.p_use_elite if is_elite
+                 else self.cfg.p_use_before_race)
+        if rng.random() > p_use:
             return
         t_target = rng.uniform(self.cfg.use_window_start_min,
                                self.cfg.use_window_end_min)
         wait = t_target - self.env.now
         if wait > 0:
             yield self.env.timeout(wait)
+
+        # Balk if all porta-johns busy
+        all_busy = self.porta_johns.count >= self.porta_johns.capacity
+        if all_busy and rng.random() < self.cfg.balk_prob_when_full:
+            self.metrics.porta_balked.append(("start", self.env.now))
+            return
+
+        # Patience-bounded request
         t_q = self.env.now
-        with self.porta_johns.request() as req:
-            yield req
+        patience = max(0.1, rng.normal(self.cfg.patience_mean_min,
+                                       self.cfg.patience_std_min))
+        req = self.porta_johns.request()
+        result = yield req | self.env.timeout(patience)
+        if req in result:
             self.metrics.start_porta_wait_min.append(self.env.now - t_q)
             yield self.env.timeout(_lognormal(rng,
                                               self.cfg.use_time_mean_min,
                                               self.cfg.use_time_std_min))
+            self.porta_johns.release(req)
+        else:
+            req.cancel()
+            self.metrics.porta_reneged.append(("start", self.env.now,
+                                                self.env.now - t_q))
 
 
 def _race_segment(env, bib, finish_target, flat_pace_factor, aid_stations,
-                  bikes, ambulances, med_cfg, metrics, rng):
+                  bikes, ambulances, med_cfg, metrics, rng, is_elite: bool = False):
     """The race itself (assumes runner has already started -- env.now >= corral time).
     finish_target: pre-sampled finish time in minutes."""
     flat_pace = finish_target / flat_pace_factor
@@ -741,7 +827,7 @@ def _race_segment(env, bib, finish_target, flat_pace_factor, aid_stations,
                 bikes, ambulances, med_cfg, metrics, rng))
             if removed:
                 return
-        yield env.process(station.visit(bib, rng))
+        yield env.process(station.visit(bib, rng, is_elite))
         last_mile = station.cfg.mile
 
     leg_len = COURSE_MILES - last_mile
@@ -757,36 +843,30 @@ def _race_segment(env, bib, finish_target, flat_pace_factor, aid_stations,
 
 def runner_lifecycle(env, bib, bus_stop, corral_name, corral_start_offset,
                      finish_time, flat_pace_factor, aid_stations, bikes,
-                     ambulances, start_area, med_cfg, metrics, rng):
+                     ambulances, start_area, med_cfg, metrics, rng,
+                     is_elite: bool = False):
     """Full journey: arrive at bus stop -> bus -> start area -> corral -> race.
-    finish_time: this runner's pre-sampled finish time (used inside _race_segment).
-    corral_start_offset: minutes after race start when this runner's corral begins.
+    is_elite: True if this runner is in the fastest corral (corral 0 of CorralPlan).
+              Elite runners use porta-johns less frequently.
     """
-    # 1. Arrive at bus stop at random time within window
     t_arr = rng.uniform(bus_stop.cfg.arrival_start_min,
                         bus_stop.cfg.arrival_end_min)
     wait = t_arr - env.now
     if wait > 0:
         yield env.timeout(wait)
 
-    # 2. Bus stop queue, board, travel to start
     yield env.process(bus_stop.board_and_travel(bib, rng))
+    yield env.process(start_area.maybe_use(bib, rng, is_elite))
 
-    # 3. Start area porta-john (probabilistic, with target use time)
-    yield env.process(start_area.maybe_use(bib, rng))
-
-    # 4. Wait for corral start
     wait = corral_start_offset - env.now
     if wait < 0:
         metrics.late_to_corral.append((bib, -wait))
-        # Runner still starts (corral let them go), but is "late"
     else:
         yield env.timeout(wait)
 
-    # 5. Race
     yield env.process(_race_segment(env, bib, finish_time, flat_pace_factor,
                                     aid_stations, bikes, ambulances,
-                                    med_cfg, metrics, rng))
+                                    med_cfg, metrics, rng, is_elite))
 
 
 # ---------------------------------------------------------------------------
@@ -873,10 +953,12 @@ def run_marathon_full(seed: int = 42,
         name = corral_plan.names[ci]
         off  = corral_plan.start_offsets_min[ci]
         ft   = float(finish_times[bib_idx])
+        is_elite = (ci == 0)         # fastest corral
         env.process(runner_lifecycle(env, bib_idx + 1, stop, name, off, ft,
                                      COURSE_FLAT_EQUIVALENT_MILES,
                                      aid_stations, bikes, ambulances,
-                                     start_area, med_cfg, metrics, rng))
+                                     start_area, med_cfg, metrics, rng,
+                                     is_elite))
 
     env.run(until=sim_horizon_min)
     return metrics, monitor
@@ -886,23 +968,25 @@ def run_marathon_full(seed: int = 42,
 # 14. Recommended configurations
 # ---------------------------------------------------------------------------
 def make_recommended_aid_configs(n_runners: int = 4500) -> list:
-    """Per-station server counts that reflect pack-density physics:
-    early stations get the bunched corral pack and need more hands;
-    late stations see a spread-out field and need fewer."""
+    """Per-station configs reflecting pack-density physics: early stations get
+    the bunched corral pack and need more hands and faster prep; late stations
+    see a spread-out field and need less of everything."""
     configs = []
     for m in AID_STATION_MILES:
-        if   m < 8:   servers = 16     # bunched pack, high arrival burst
-        elif m < 18:  servers = 10     # pack spreading
-        else:         servers = 6      # well-spread
-        # Inventory scales with field size
+        if m < 8:
+            servers, prep_w, prep_e, prep_s = 16, 300, 100, 120
+        elif m < 18:
+            servers, prep_w, prep_e, prep_s = 10, 200, 70, 90
+        else:
+            servers, prep_w, prep_e, prep_s = 6, 120, 50, 60
         configs.append(AidStationConfig(
             mile=m,
             servers=servers,
-            porta_johns=4,
-            trash_capacity=int(1.6 * n_runners),       # ~one capacity per runner * 1.5x buffer
-            water_cups=int(1.5 * n_runners),
-            electrolyte_cups=int(1.0 * n_runners),
-            snacks=int(1.2 * n_runners),
+            porta_johns=8,
+            trash_capacity=int(1.6 * n_runners),
+            water_prep_per_min=prep_w,
+            electrolyte_prep_per_min=prep_e,
+            snacks_prep_per_min=prep_s,
         ))
     return configs
 
@@ -928,8 +1012,13 @@ DEFAULT_TARGETS = {
     "start_porta_p95_min":        Target("Start porta-john wait p95 (min)", 5, 15, "min"),
     "stranded_count":             Target("Runners stranded at bus stop",   0,   0,  ""),
     "late_to_corral_count":       Target("Runners late to corral",         0,  50,  ""),
-    "stockout_count":             Target("Supply stockout events",         0,   0,  ""),
-    "trash_overflow_count":       Target("Trash overflow events",          0,   5,  ""),
+    "stockout_count":             Target("Supply stockout events",         0, 100, ""),
+    "trash_overflow_count":       Target("Trash overflow events",          0,   5, ""),
+    # Service-failure metrics from balking & reneging
+    "aid_balk_count":             Target("Aid station balks (skipped)",    0, 200, ""),
+    "aid_renege_count":           Target("Aid station reneges",            0,  50, ""),
+    "porta_balk_count":           Target("Porta-john balks",               0, 100, ""),
+    "porta_renege_count":         Target("Porta-john reneges",             0,  50, ""),
 }
 
 
@@ -957,6 +1046,10 @@ def _extract_metrics(metrics: RaceMetrics) -> dict:
         "late_to_corral_count":  float(len(metrics.late_to_corral)),
         "stockout_count":        float(len(metrics.stockouts)),
         "trash_overflow_count":  float(len(metrics.trash_overflows)),
+        "aid_balk_count":        float(len(metrics.aid_balked)),
+        "aid_renege_count":      float(len(metrics.aid_reneged)),
+        "porta_balk_count":      float(len(metrics.porta_balked)),
+        "porta_renege_count":    float(len(metrics.porta_reneged)),
     }
 
 
@@ -1094,6 +1187,83 @@ def corral_sensitivity_sweep(plans: dict,
             d["n_finishers"] = len(m.finishes)
             rows.append(d)
     return pd.DataFrame(rows)
+
+
+def paired_seed_compare(config_A: dict,
+                        config_B: dict,
+                        metric_keys: list | None = None,
+                        n_pairs: int = 20,
+                        n_runners: int = 1500,
+                        base_seed: int = 0,
+                        label_A: str = "A",
+                        label_B: str = "B") -> pd.DataFrame:
+    """Paired-seed (Common Random Numbers) comparison of two configurations.
+
+    For each seed in {base_seed, ..., base_seed+n_pairs-1}, runs BOTH config_A
+    and config_B with the same seed. Per-rep differences then have much lower
+    variance than independent samples, so a paired t-test has higher power.
+    Use when claiming "B beats A on metric M" rigorously.
+    """
+    from scipy import stats
+    if metric_keys is None:
+        metric_keys = list(DEFAULT_TARGETS.keys())
+    a_rows, b_rows = [], []
+    for i in range(n_pairs):
+        seed = base_seed + i
+        m_a, _ = run_marathon_full(seed=seed, n_runners=n_runners,
+                                   monitor_interval_min=9999.0, **config_A)
+        m_b, _ = run_marathon_full(seed=seed, n_runners=n_runners,
+                                   monitor_interval_min=9999.0, **config_B)
+        a_rows.append(_extract_metrics(m_a))
+        b_rows.append(_extract_metrics(m_b))
+    df_a = pd.DataFrame(a_rows)
+    df_b = pd.DataFrame(b_rows)
+
+    rows = []
+    for k in metric_keys:
+        a_vals = df_a[k].values
+        b_vals = df_b[k].values
+        diffs  = b_vals - a_vals
+        if np.allclose(diffs, 0):
+            t_stat, p_val = 0.0, 1.0
+        else:
+            t_stat, p_val = stats.ttest_rel(a_vals, b_vals)
+        d_mean = float(diffs.mean())
+        d_se   = float(diffs.std(ddof=1) / np.sqrt(n_pairs)) if n_pairs > 1 else 0.0
+        ci_lo, ci_hi = d_mean - 1.96 * d_se, d_mean + 1.96 * d_se
+        tgt = DEFAULT_TARGETS.get(k)
+        rows.append({
+            "metric":      tgt.name if tgt else k,
+            f"{label_A}_mean": float(a_vals.mean()),
+            f"{label_B}_mean": float(b_vals.mean()),
+            "B_minus_A":   d_mean,
+            "diff_ci_lo":  ci_lo,
+            "diff_ci_hi":  ci_hi,
+            "t_stat":      float(t_stat),
+            "p_value":     float(p_val),
+            "significant": bool(p_val < 0.05),
+        })
+    return pd.DataFrame(rows)
+
+
+def print_paired_comparison(df: pd.DataFrame,
+                            label_A: str = "A", label_B: str = "B"):
+    print(f"\n{'='*100}")
+    print(f"{'Paired-seed comparison: '+label_A+' vs '+label_B:^100}")
+    print(f"{'(B_minus_A < 0 means B IMPROVES that metric)':^100}")
+    print(f"{'='*100}")
+    hdr = (f"{'Metric':<38}{label_A+'_mean':>11}{label_B+'_mean':>11}"
+           f"{'B-A':>10}{'95% CI':>20}{'p':>10}{'sig':>6}")
+    print(hdr)
+    print("-" * 100)
+    for _, r in df.iterrows():
+        ci = f"[{r['diff_ci_lo']:+.2f}, {r['diff_ci_hi']:+.2f}]"
+        sig = "***" if r["p_value"] < 0.001 else "**" if r["p_value"] < 0.01 \
+              else "*" if r["p_value"] < 0.05 else ""
+        a_m = f"{r[label_A+'_mean']:.2f}"
+        b_m = f"{r[label_B+'_mean']:.2f}"
+        print(f"{r['metric']:<38}{a_m:>11}{b_m:>11}{r['B_minus_A']:>+10.2f}{ci:>20}"
+              f"{r['p_value']:>10.4f}{sig:>6}")
 
 
 if __name__ == "__main__":
