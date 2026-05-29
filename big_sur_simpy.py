@@ -22,19 +22,70 @@ from scipy import stats
 
 
 # ---------------------------------------------------------------------------
-# 1. Fitted finish-time distribution (Weibull from v1)
+# 1. Fitted finish-time distribution
 # ---------------------------------------------------------------------------
+# Distribution model selected after fitting 25+ candidates to the Big Sur
+# 2018-2026 chip-time data (n = 23,631). Ranked by AIC:
+#
+#   GMM-3 (Gaussian mixture):  AIC = 245,419   best fit, captures 3 pace modes
+#   Johnson SB:                AIC = 245,521   best single-distribution fit
+#   Generalized Normal:        AIC = 245,567
+#   Truncated Normal (b=385):  AIC = 246,258
+#   Weibull (previous default):AIC = 246,333   beaten by 914 AIC pts
+#
+# Johnson SB has bounded support that naturally respects the ~6:25 effective
+# cutoff. GMM-3 captures real population structure (fast/middle/slow modes).
+# Default is "jsb" (Johnson SB) -- one line swap from the old code, dramatic
+# AIC improvement. Set FINISH_TIME_MODEL = "gmm3" to use the mixture.
+
+FINISH_TIME_MODEL = "gmm3"         # one of {"jsb", "gmm3", "weibull"}; GMM-3 = best AIC
+CUTOFF_MIN = 6 * 60                # used to cap rare samples beyond the data
+SAMPLE_MAX_MIN = 385               # empirical maximum + small margin
+
+# --- Johnson SB parameters (default) ---
+JSB_A     = -0.220325
+JSB_B     =  1.225420
+JSB_LOC   = 140.730
+JSB_SCALE = 251.492
+
+# --- GMM-3 component parameters ---
+GMM3_WEIGHTS = (0.3344, 0.3888, 0.2767)
+GMM3_MEANS   = (228.830, 278.399, 329.991)
+GMM3_STDS    = ( 23.689,  20.296,  19.566)
+
+# --- Weibull (kept for backward comparison) ---
 WEIBULL_C     = 3.481957
 WEIBULL_LOC   = 137.042230
 WEIBULL_SCALE = 154.822742
-CUTOFF_MIN    = 6 * 60                # 6-hr permit cutoff in minutes
+
 
 def sample_finish_time(rng: np.random.Generator) -> float:
-    dist = stats.weibull_min(WEIBULL_C, loc=WEIBULL_LOC, scale=WEIBULL_SCALE)
-    while True:
-        t = dist.rvs(random_state=rng)
-        if t <= CUTOFF_MIN:
-            return float(t)
+    """Sample one finish time in minutes from the configured model.
+    Rejects samples beyond SAMPLE_MAX_MIN (~6:25) so the simulation horizon
+    aligns with the empirical data."""
+    if FINISH_TIME_MODEL == "jsb":
+        while True:
+            t = float(stats.johnsonsb.rvs(JSB_A, JSB_B,
+                                          loc=JSB_LOC, scale=JSB_SCALE,
+                                          random_state=rng))
+            if t <= SAMPLE_MAX_MIN:
+                return t
+    elif FINISH_TIME_MODEL == "gmm3":
+        # Normalize once in case literals don't sum to exactly 1
+        _w = np.array(GMM3_WEIGHTS, dtype=float)
+        _w = _w / _w.sum()
+        while True:
+            comp = int(rng.choice(3, p=_w))
+            t = float(rng.normal(GMM3_MEANS[comp], GMM3_STDS[comp]))
+            if 130.0 <= t <= SAMPLE_MAX_MIN:
+                return t
+    else:   # legacy Weibull
+        while True:
+            t = float(stats.weibull_min.rvs(WEIBULL_C,
+                                            loc=WEIBULL_LOC, scale=WEIBULL_SCALE,
+                                            random_state=rng))
+            if t <= SAMPLE_MAX_MIN:
+                return t
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +287,7 @@ class MedicalConfig:
     num_bike_medics:       int   = 12
     ambulance_locations:   tuple = (3.0, 10.0, 17.0, 24.0)
     bike_locations:        tuple = (2.5, 7.0, 10.4, 13.1, 16.9, 19.0, 21.2, 24.5)
-    bike_speed_mph:        float = 12.0
+    bike_speed_mph:        float = 16.0   # realistic patrol-bike pace (was 12)
     ambulance_speed_mph:   float = 20.0
     # severity -> probability
     severity_prob:         tuple = (("minor", 0.65), ("medium", 0.25), ("high", 0.10))
@@ -1002,13 +1053,13 @@ class Target:
     units:       str = ""
 
 DEFAULT_TARGETS = {
-    "aid_wait_p95_sec":           Target("Aid wait p95 (sec)",            10,  30, "sec"),
+    "aid_wait_p95_sec":           Target("Aid wait p95 (sec)",            3,   15, "sec"),
     "aid_wait_max_sec":           Target("Aid wait max (sec)",            10,  60, "sec"),
     "porta_wait_p95_min":         Target("Aid porta-john wait p95 (min)", 5,   15, "min"),
-    "med_resp_p90_minor_min":     Target("Med response p90, minor (min)", 5,   10, "min"),
-    "med_resp_p90_high_min":      Target("Med response p90, high (min)",  3,    6, "min"),
+    "med_resp_p90_minor_min":     Target("Med response p90, minor (min)", 2,    5, "min"),
+    "med_resp_p90_high_min":      Target("Med response p90, high (min)",  2,    4, "min"),
     "amb_resp_p90_min":           Target("Ambulance p90 from call (min)", 15,  25, "min"),
-    "bus_wait_p95_min":           Target("Bus stop wait p95 (min)",       15,  30, "min"),
+    "bus_wait_p95_min":           Target("Bus boarding queue p95 (min)",  15,  30, "min"),
     "start_porta_p95_min":        Target("Start porta-john wait p95 (min)", 5, 15, "min"),
     "stranded_count":             Target("Runners stranded at bus stop",   0,   0,  ""),
     "late_to_corral_count":       Target("Runners late to corral",         0,  50,  ""),
