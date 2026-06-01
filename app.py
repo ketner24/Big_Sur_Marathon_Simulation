@@ -103,7 +103,7 @@ def parameter_sidebar(key_prefix: str = "single"):
     aid_pj     = slv("Porta-johns per station",          2, 16, "aid_pj")
     prep_w     = slv("Water prep rate (cups/min, early)",     80, 600, "water_prep", step=10)
     prep_e     = slv("Electrolyte prep rate (cups/min, early)", 50, 350, "electrolyte_prep", step=10,
-                     help="Mile 2.5 is the binding stockout location.")
+                     help_text="Mile 2.5 is the binding stockout location.")
     init_buf   = st.sidebar.slider("Initial water buffer (cups)", 50, 400, 200, 20, key=p("buf"))
 
     st.sidebar.header("🚑 Medical (bike teams)")
@@ -125,11 +125,11 @@ def parameter_sidebar(key_prefix: str = "single"):
         n_even_teams = 8   # BSIM has 8 fixed teams
         st.sidebar.caption("ℹ️ BSIM mode uses 8 fixed teams: Z1, Z2, Z3, Z4S, Z4N, Z5, Z6, Z7 with documented time windows.")
     patrol_sp   = slv("Bike patrol speed (mph)",     8, 18, "bike_patrol_speed",
-                     help="Cruising pace while patrolling assigned zone.")
+                     help_text="Cruising pace while patrolling assigned zone.")
     response_sp = slv("Bike response speed (mph)", 10, 24, "bike_response_speed",
-                     help="Sprint pace when called to an injury.")
+                     help_text="Sprint pace when called to an injury.")
     n_ambulances = slv("Ambulances", 2, 10, "n_ambulances",
-                       help="Ambulances transport HIGH-severity injuries (counted as DNF).")
+                       help_text="Ambulances transport HIGH-severity injuries (counted as DNF).")
 
     # ---- Advanced: injury severity (calibrated by default) ----
     with st.sidebar.expander("⚙️ Advanced: injury severity (calibrated)"):
@@ -148,9 +148,9 @@ def parameter_sidebar(key_prefix: str = "single"):
     start_pj = slv("Porta-johns at start (real: 146)", 30, 200, "start_pj")
     st.sidebar.markdown("**Bus check-in (mandatory queue)**")
     bus_vol  = slv("Volunteers per stop", 1, 8, "bus_volunteers",
-                  help="Each volunteer checks ticket + name. Runners CANNOT leave the queue.")
+                  help_text="Each volunteer checks ticket + name. Runners CANNOT leave the queue.")
     bus_svc  = slv("Check-in service time (sec/runner)", 5, 30, "bus_checkin_sec",
-                  help="18 sec = manual ticket + name. ~5 sec = barcode scanner.")
+                  help_text="18 sec = manual ticket + name. ~5 sec = barcode scanner.")
 
     # ---- Build configs ----
     if bike_mode.startswith("Even"):
