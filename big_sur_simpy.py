@@ -1256,6 +1256,16 @@ class Target:
     failure:     float   # value above this counts as a failure
     units:       str = ""
 
+    @property
+    def target_value(self) -> float:
+        """Compatibility alias for Streamlit UI code that used target_value."""
+        return self.target
+
+    @property
+    def failure_value(self) -> float:
+        """Compatibility alias for Streamlit UI code that used failure_value."""
+        return self.failure
+
 DEFAULT_TARGETS = {
     "aid_wait_p95_sec":           Target("Aid wait p95 (sec)",            3,   15, "sec"),
     "aid_wait_max_sec":           Target("Aid wait max (sec)",            10,  60, "sec"),
@@ -1369,7 +1379,15 @@ def run_monte_carlo(n_reps: int = 30,
                     base_seed: int = 0,
                     **kwargs) -> pd.DataFrame:
     """Run N independent replications; return DataFrame with one row per rep.
-    All run_marathon_full kwargs (station_cfgs, med_cfg, corral_plan, ...) pass through."""
+    All run_marathon_full kwargs (station_cfgs, med_cfg, corral_plan, ...) pass through.
+
+    Backward-compatible note: older app.py versions passed `seed=` instead
+    of `base_seed=`. Pop that alias so it is not forwarded to
+    run_marathon_full along with the per-rep seed.
+    """
+    if "seed" in kwargs:
+        base_seed = int(kwargs.pop("seed"))
+
     rows = []
     for rep in range(n_reps):
         m, _ = run_marathon_full(seed=base_seed + rep, n_runners=n_runners, **kwargs)

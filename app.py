@@ -213,15 +213,15 @@ def render_target_table(metrics: dict, container=st):
     for key, tgt in DEFAULT_TARGETS.items():
         if key not in metrics: continue
         v = metrics[key]
-        if v <= tgt.target_value:   status = "PASS"
-        elif v <= tgt.failure_value: status = "WARN"
+        if v <= tgt.target:   status = "PASS"
+        elif v <= tgt.failure: status = "WARN"
         else:                       status = "FAIL"
         rows.append({
             "Status": color_map[status],
             "Metric": tgt.name,
             "Value":  f"{v:.2f}",
-            "Target ≤": f"{tgt.target_value}",
-            "Fail ≥":   f"{tgt.failure_value}",
+            "Target ≤": f"{tgt.target}",
+            "Fail ≥":   f"{tgt.failure}",
         })
     container.table(pd.DataFrame(rows))
 
@@ -244,7 +244,7 @@ def tab_single():
     if st.button("Run scenario", type="primary"):
         with st.spinner(f"Running {n_reps} replications..."):
             t0 = time.time()
-            df = run_monte_carlo(n_reps=n_reps, seed=cfg["base_seed"],
+            df = run_monte_carlo(n_reps=n_reps, base_seed=cfg["base_seed"],
                                  n_runners=cfg["n_runners"], station_cfgs=cfg["station_cfgs"],
                                  med_cfg=cfg["med_cfg"], start_area_cfg=cfg["start_area_cfg"],
                                  corral_plan=cfg["corral_plan"],
@@ -531,8 +531,8 @@ def tab_sweep():
         ax.set_ylabel(metric_label, fontsize=11)
         ax.grid(True, alpha=0.3)
         if metric in DEFAULT_TARGETS:
-            ax.axhline(DEFAULT_TARGETS[metric].target_value, ls="--", color="green",
-                       label=f"target {DEFAULT_TARGETS[metric].target_value}")
+            ax.axhline(DEFAULT_TARGETS[metric].target, ls="--", color="green",
+                       label=f"target {DEFAULT_TARGETS[metric].target}")
             ax.legend()
         ax.set_title(f"{parameter} vs. {metric_label}", fontweight="bold")
         st.pyplot(fig)
