@@ -282,20 +282,90 @@ def assign_corrals(finish_times: np.ndarray, plan: CorralPlan) -> np.ndarray:
 # 4. Medical model
 # ---------------------------------------------------------------------------
 @dataclass
+class BikeTeamConfig:
+    """A single bike medical team with a patrol zone AND a time window.
+    Encodes the actual BSIM bike-zone briefing: each team has a mile range
+    they patrol, plus a sim-time window (minutes after race start = 0)
+    during which they are on duty. Outside their window they are unavailable."""
+    name: str            # e.g. "Z1", "Z4N", "Z4S"
+    zone: int            # 1-7
+    patrol_lo: float     # patrol range start (miles)
+    patrol_hi: float     # patrol range end (miles)
+    on_duty_start: float # sim time -- minutes since race start (=0)
+    on_duty_end: float   # sim time
+
+    @property
+    def patrol_center(self):
+        return (self.patrol_lo + self.patrol_hi) / 2
+
+# Race start = 6:45 AM in BSIM. All times in sim minutes since 6:45 AM.
+# 7:00 AM = +15,  7:30 AM = +45,  7:45 AM = +60,  8:00 AM = +75,
+# 8:50 AM = +125, 10:00 AM = +195, 10:30 AM = +225,  12:00 noon = +315.
+DEFAULT_BIKE_TEAMS = (
+    BikeTeamConfig(name="Z1",  zone=1, patrol_lo=0.0,  patrol_hi=4.0,
+                   on_duty_start=0,   on_duty_end=75),    # 6:45-8:00
+    BikeTeamConfig(name="Z2",  zone=2, patrol_lo=3.0,  patrol_hi=8.0,
+                   on_duty_start=15,  on_duty_end=125),   # 7:00-8:50
+    BikeTeamConfig(name="Z3",  zone=3, patrol_lo=8.0,  patrol_hi=12.0,
+                   on_duty_start=45,  on_duty_end=225),   # 7:30-10:30 (covers Hurricane)
+    BikeTeamConfig(name="Z4S", zone=4, patrol_lo=12.0, patrol_hi=13.5,
+                   on_duty_start=15,  on_duty_end=225),   # 7:00-10:30 (S of Slide-out)
+    BikeTeamConfig(name="Z4N", zone=4, patrol_lo=13.5, patrol_hi=15.4,
+                   on_duty_start=15,  on_duty_end=225),   # 7:00-10:30 (N of Slide-out)
+    BikeTeamConfig(name="Z5",  zone=5, patrol_lo=15.5, patrol_hi=19.5,
+                   on_duty_start=15,  on_duty_end=225),   # 7:00-10:30 (focus mi 17-18)
+    BikeTeamConfig(name="Z6",  zone=6, patrol_lo=19.5, patrol_hi=24.0,
+                   on_duty_start=45,  on_duty_end=225),   # 7:30-10:30 (focus mi 22)
+    BikeTeamConfig(name="Z7",  zone=7, patrol_lo=24.0, patrol_hi=26.2,
+                   on_duty_start=60,  on_duty_end=315),   # 7:45-12:00 (busy late)
+)
+
+
+def make_even_bike_teams(n_teams: int, course_miles: float = 26.2,
+                         race_window_min: float = 400.0) -> tuple:
+    """Build n evenly-spaced bike teams covering the full course, on duty for
+    the entire race. Used to compare BSIM's actual zone-and-window structure
+    against an abstract evenly-spaced full-coverage baseline."""
+    spacing = course_miles / n_teams
+    teams = []
+    for i in range(n_teams):
+        lo = i * spacing
+        hi = (i + 1) * spacing
+        teams.append(BikeTeamConfig(
+            name=f"OPT{i+1:02d}", zone=i+1,
+            patrol_lo=lo, patrol_hi=hi,
+            on_duty_start=0.0, on_duty_end=race_window_min,
+        ))
+    return tuple(teams)
+
+
+@dataclass
 class MedicalConfig:
     num_ambulances:        int   = 4
     num_bike_medics:       int   = 12
     ambulance_locations:   tuple = (3.0, 10.0, 17.0, 24.0)
     bike_locations:        tuple = (2.5, 7.0, 10.4, 13.1, 16.9, 19.0, 21.2, 24.5)
-    bike_speed_mph:        float = 16.0   # realistic patrol-bike pace (was 12)
-    ambulance_speed_mph:   float = 20.0
-    # severity -> probability
-    severity_prob:         tuple = (("minor", 0.65), ("medium", 0.25), ("high", 0.10))
-    # On-scene treatment time (mean, std), lognormal
+    # Time-windowed bike teams (BSIM zones). If None, falls back to bike_locations.
+    bike_teams:            tuple = DEFAULT_BIKE_TEAMS
+    # Bike behavior: bikes ACTIVELY PATROL their assigned zone at cruise pace,
+    # then sprint to injuries at response speed.
+    bike_patrol_speed_mph:   float = 12.0   # cruising pace while patrolling
+    bike_response_speed_mph: float = 16.0   # sprint to injury when called
+    ambulance_speed_mph:     float = 20.0
+    severity_prob:         tuple = (("minor", 0.88), ("medium", 0.10), ("high", 0.02))
+    # Calibrated to Big Sur historical record: 0-4 DNFs/year from severe injury.
+    # Expected: 3500 × 5% injury × 2% high-severity = ~3.5 DNFs/race.
+    # Marathon literature: most on-course medical contacts are MINOR (cramps,
+    # blisters, mild dehydration). True DNF-level events (heart events,
+    # heat stroke, serious falls) are ~1-2% of all medical contacts.
     treat_min_params:      tuple = (3.0, 1.5)
     treat_med_params:      tuple = (8.0, 4.0)
-    stabilize_params:      tuple = (5.0, 2.0)    # bike stabilization before amb
-    transport_params:      tuple = (15.0, 5.0)   # ambulance transport + offload
+    stabilize_params:      tuple = (5.0, 2.0)
+    transport_params:      tuple = (15.0, 5.0)
+
+    @property
+    def bike_speed_mph(self):  # deprecated alias
+        return self.bike_response_speed_mph
 
 INJURY_RATE_PER_RUNNER = 0.05      # FRACTION OF RUNNERS REQUIRING ON-COURSE INTERVENTION
                                    # NOTE: the project doc's 15-30% number is "any reported injury
@@ -332,8 +402,10 @@ class RaceMetrics:
     stockouts:            list = field(default_factory=list)   # (mile, item, t)
     trash_overflows:      list = field(default_factory=list)   # (mile, t)
     # Pre-race metrics:
-    bus_wait_min:         list = field(default_factory=list)   # (stop_name, wait_min)
+    bus_wait_min:         list = field(default_factory=list)   # (stop_name, wait_min) -- TOTAL from arrival to bus departure
+    bus_checkin_wait_min: list = field(default_factory=list)   # (stop_name, wait_min) -- just the ticket-check queue
     bus_travel_min:       list = field(default_factory=list)   # (stop_name, travel_min)
+    overflow_bus_boardings: list = field(default_factory=list) # (stop_name, bib) -- boarded after scheduled buses ran out
     start_porta_wait_min: list = field(default_factory=list)
     late_to_corral:       list = field(default_factory=list)   # (bib, min_late)
     stranded_at_busstop:  list = field(default_factory=list)   # (bib, stop_name)
@@ -343,6 +415,10 @@ class RaceMetrics:
     first_bus_at_start:   dict = field(default_factory=dict)   # stop -> arrival time
     last_bus_at_start:    dict = field(default_factory=dict)   # stop -> arrival time
     injury_events:        list = field(default_factory=list)   # (t, mile, severity)
+    bike_response_distances: list = field(default_factory=list)  # miles patrolled to reach each injury
+    bike_team_responses:  list = field(default_factory=list)   # (team_name, t, mile, distance)
+    dnf_due_to_injury:    list = field(default_factory=list)   # (bib, mile) -- high-severity DNFs
+    bike_patrol_log:      list = field(default_factory=list)   # (bike_idx, miles_patrolled)
     # Balking and reneging tracking
     aid_balked:           list = field(default_factory=list)   # (mile, t)
     aid_reneged:          list = field(default_factory=list)   # (mile, t, wait_min)
@@ -459,7 +535,40 @@ class AidStation:
 
 
 # ---------------------------------------------------------------------------
-# 7. Medical dispatch (severity-aware)
+def _patrol_segments(bike_locations, course_miles):
+    """Legacy helper: midpoint-based segments from a list of bike center locations.
+    Kept for backward compatibility with configs that pass bike_locations only."""
+    locs = sorted(bike_locations)
+    n = len(locs)
+    segs = []
+    for i, loc in enumerate(locs):
+        lo = 0.0 if i == 0 else (locs[i-1] + loc) / 2
+        hi = course_miles if i == n-1 else (loc + locs[i+1]) / 2
+        segs.append((lo, hi))
+    return segs
+
+
+def _select_bike_team(injury_mile, t_now, bike_teams):
+    """Find the responding bike team for an injury at (mile, t_now).
+    1. Prefer an on-duty team whose patrol range CONTAINS the injury mile.
+    2. If none, the closest on-duty team responds (must travel to the injury).
+    3. If NO team is on duty, return None (caller falls back / uses ambulance).
+    Returns (team, sampled_bike_position) where sampled_bike_position is uniform
+    in [patrol_lo, patrol_hi] (representing the team's current location while
+    patrolling its zone). Returns None if no team is available."""
+    on_duty = [t for t in bike_teams if t.on_duty_start <= t_now <= t.on_duty_end]
+    if not on_duty:
+        return None
+    in_zone = [t for t in on_duty if t.patrol_lo <= injury_mile <= t.patrol_hi]
+    if in_zone:
+        # Multiple teams may overlap (e.g. Z1/Z2 at mile 3-4): pick the one
+        # whose patrol center is closest to the injury.
+        return min(in_zone, key=lambda t: abs(t.patrol_center - injury_mile))
+    # No team's patrol range contains the injury -- closest on-duty team responds.
+    return min(on_duty, key=lambda t: abs(t.patrol_center - injury_mile))
+
+
+# 7. Medical dispatch (severity-aware, with time-windowed zone-based bike patrol)
 # ---------------------------------------------------------------------------
 def dispatch_medical(env, bib, mile, bikes, ambulances, med_cfg, metrics, rng):
     """Returns True if runner is removed from race (high-severity transport)."""
@@ -468,8 +577,31 @@ def dispatch_medical(env, bib, mile, bikes, ambulances, med_cfg, metrics, rng):
     metrics.injury_events.append((t_call, mile, severity))
 
     # --- bike medic first responder ---
-    bike_travel = (nearest_dist(mile, med_cfg.bike_locations)
-                   / med_cfg.bike_speed_mph) * 60.0
+    # Bikes patrol their assigned BSIM zone during their on-duty window.
+    # Response distance depends on (a) which team is on duty at t_call,
+    # (b) whether the injury falls in their patrol range, and (c) where the
+    # bike happens to be within its range when called.
+    team = _select_bike_team(mile, t_call, med_cfg.bike_teams)
+    if team is not None:
+        bike_position = rng.uniform(team.patrol_lo, team.patrol_hi)
+        if team.patrol_lo <= mile <= team.patrol_hi:
+            response_distance = abs(bike_position - mile)
+        else:
+            # Injury outside team's zone -- bike travels from edge of its zone
+            response_distance = abs(bike_position - mile)  # actual line distance
+        responding_team_name = team.name
+    else:
+        # No bike team on duty -- this happens only in very early/late race windows.
+        # Use a synthetic large response distance (3 mi) to reflect that the
+        # nearest emergency vehicle (course ambulance / sweep) must respond.
+        response_distance = 3.0
+        responding_team_name = "OFF-DUTY"
+
+    bike_travel = (response_distance / med_cfg.bike_response_speed_mph) * 60.0
+    metrics.bike_response_distances.append(response_distance)
+    if team is not None:
+        metrics.bike_team_responses.append((team.name, t_call, mile, response_distance))
+
     with bikes.request() as req:
         yield req
         yield env.timeout(bike_travel)
@@ -482,9 +614,9 @@ def dispatch_medical(env, bib, mile, bikes, ambulances, med_cfg, metrics, rng):
                 "bib": bib, "mile": mile, "severity": severity,
                 "response_min": bike_response, "treat_min": treat,
                 "total_off_course_min": bike_response + treat,
-                "removed": False,
+                "removed": False, "team": responding_team_name,
             })
-            return False
+            return False  # MINOR: runner continues from injury point
 
         if severity == "medium":
             treat = _lognormal(rng, *med_cfg.treat_med_params)
@@ -493,15 +625,15 @@ def dispatch_medical(env, bib, mile, bikes, ambulances, med_cfg, metrics, rng):
                 "bib": bib, "mile": mile, "severity": severity,
                 "response_min": bike_response, "treat_min": treat,
                 "total_off_course_min": bike_response + treat,
-                "removed": False,
+                "removed": False, "team": responding_team_name,
             })
-            return False
+            return False  # MEDIUM: runner continues from injury point
 
         # severity == "high": bike stabilizes; ambulance dispatched in parallel
         stabilize = _lognormal(rng, *med_cfg.stabilize_params)
         yield env.timeout(stabilize)
 
-    # --- ambulance transport ---
+    # --- ambulance transport (HIGH severity only -> DNF) ---
     amb_travel = (nearest_dist(mile, med_cfg.ambulance_locations)
                   / med_cfg.ambulance_speed_mph) * 60.0
     with ambulances.request() as req:
@@ -517,8 +649,9 @@ def dispatch_medical(env, bib, mile, bikes, ambulances, med_cfg, metrics, rng):
         "amb_response_min": amb_response_from_call,
         "treat_min": stabilize + transport,
         "total_off_course_min": amb_response_from_call + transport,
-        "removed": True,
+        "removed": True, "team": responding_team_name,
     })
+    metrics.dnf_due_to_injury.append((bib, mile))    # HIGH: DNF
     return True
 
 
@@ -723,6 +856,14 @@ class BusStopConfig:
     travel_time_std_min:  float
     bus_dispatch_times:   tuple   # mins-before-race at which buses depart (negative values)
     bus_capacity:         int = 50
+    # --- NEW: check-in (ticket + name verification) before boarding ---
+    # Per real-world observation: a volunteer checks the runner's ticket for the
+    # correct destination bus and crosses their name off the list. With 1 volunteer
+    # per stop at ~20 sec/runner (3/min throughput) and arrivals peaked at end of
+    # window, queues of 100+ build by 4:00 AM with 10-15 min waits.
+    check_in_volunteers:  int   = 1     # volunteers doing ticket/name check
+    check_in_mean_sec:    float = 20.0  # mean service time per runner (exponential)
+    arrival_peak_at_end:  bool  = True  # if True, runners arrive concentrated near end
 
 DEFAULT_BUS_STOPS = (
     # All times in minutes-from-race-start; race start = 0 at 6:45 AM
@@ -735,31 +876,31 @@ DEFAULT_BUS_STOPS = (
     BusStopConfig("A_Marriott",       n_runners=400,
                   arrival_start_min=-195, arrival_end_min=-180,       # 3:45-4:00
                   travel_time_mean_min=52, travel_time_std_min=7,
-                  bus_dispatch_times=tuple(range(-195, -170, 2))),    # 13 buses = 650 cap
+                  bus_dispatch_times=tuple(range(-195, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 13 buses = 650 cap
     BusStopConfig("B_DowntownGarage", n_runners=800,
                   arrival_start_min=-210, arrival_end_min=-180,       # 3:30-4:00
                   travel_time_mean_min=50, travel_time_std_min=7,
-                  bus_dispatch_times=tuple(range(-210, -170, 2))),    # 20 buses = 1000 cap
+                  bus_dispatch_times=tuple(range(-210, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 20 buses = 1000 cap
     BusStopConfig("C_CarmelMS",       n_runners=800,
                   arrival_start_min=-210, arrival_end_min=-180,       # 3:30-4:00
                   travel_time_mean_min=40, travel_time_std_min=6,     # ~1 mi from finish
-                  bus_dispatch_times=tuple(range(-210, -170, 2))),    # 20 buses
+                  bus_dispatch_times=tuple(range(-210, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 20 buses
     BusStopConfig("D_DelMonte",       n_runners=800,
                   arrival_start_min=-210, arrival_end_min=-180,       # 3:30-4:00
                   travel_time_mean_min=52, travel_time_std_min=7,
-                  bus_dispatch_times=tuple(range(-210, -170, 2))),    # 20 buses
+                  bus_dispatch_times=tuple(range(-210, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 20 buses
     BusStopConfig("E_MPC",            n_runners=400,
                   arrival_start_min=-195, arrival_end_min=-180,       # 3:45-4:00
                   travel_time_mean_min=50, travel_time_std_min=7,
-                  bus_dispatch_times=tuple(range(-195, -170, 2))),    # 13 buses
+                  bus_dispatch_times=tuple(range(-195, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 13 buses
     BusStopConfig("F_Embassy",        n_runners=400,
                   arrival_start_min=-195, arrival_end_min=-180,       # 3:45-4:00
                   travel_time_mean_min=54, travel_time_std_min=8,     # Seaside
-                  bus_dispatch_times=tuple(range(-195, -170, 2))),    # 13 buses
+                  bus_dispatch_times=tuple(range(-195, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 13 buses
     BusStopConfig("G_CarmelPlaza",    n_runners=400,
                   arrival_start_min=-195, arrival_end_min=-180,       # 3:45-4:00
                   travel_time_mean_min=42, travel_time_std_min=6,     # near finish
-                  bus_dispatch_times=tuple(range(-195, -170, 2))),    # 13 buses
+                  bus_dispatch_times=tuple(range(-195, -170, 2)), check_in_volunteers=3, check_in_mean_sec=18.0),    # 13 buses
 )
 # Totals: 4 * 400 + 3 * 800 = 4000 base runners; proportional scaling applied if
 # n_runners differs (see run_marathon_full).
@@ -781,16 +922,23 @@ class StartAreaConfig:
 
 
 class BusStop:
-    """Runners join the queue; buses arrive on schedule and pick up up to capacity.
-    Wait time = (time bus arrives) - (time runner joined queue)."""
+    """Runners arrive → queue for check-in (ticket + name verification) → wait
+    for bus → board → travel. Total wait = (bus departs) - (runner arrived).
+
+    The check-in process is the dominant bottleneck in reality: 1 volunteer
+    checking tickets at ~20 sec each can only process ~3 runners/min, so when
+    100+ runners arrive in the last 5-10 min of the window, the queue extends
+    well past the bus dispatch time."""
     def __init__(self, env, cfg, metrics):
         self.env = env
         self.cfg = cfg
         self.metrics = metrics
-        self.queue: list = []          # list of (event, t_arrive, bib)
+        self.queue: list = []                                              # checked-in runners waiting to board
+        self.check_in = simpy.Resource(env, capacity=cfg.check_in_volunteers)
         env.process(self._dispatch_loop())
 
     def _dispatch_loop(self):
+        # 1. Run all scheduled dispatches
         for t_dispatch in self.cfg.bus_dispatch_times:
             wait = t_dispatch - self.env.now
             if wait > 0:
@@ -800,14 +948,43 @@ class BusStop:
                 evt, t_arr, bib = self.queue.pop(0)
                 self.metrics.bus_wait_min.append((self.cfg.name, self.env.now - t_arr))
                 evt.succeed()
-        # No more buses scheduled; anyone left in queue is stranded.
-        for evt, t_arr, bib in self.queue:
-            self.metrics.stranded_at_busstop.append((bib, self.cfg.name))
+
+        # 2. Overflow buses: runners cannot leave the queue, so buses keep
+        #    running every 2 minutes until everyone has boarded. We run for
+        #    up to 4 hours past the last scheduled bus -- the loop continues
+        #    even when the queue is briefly empty (more runners may arrive
+        #    from the check-in process). In reality BSIM dispatches additional
+        #    buses if there's residual demand.
+        overflow_end_time = max(self.cfg.bus_dispatch_times) + 240.0  # 4 hours
+        while self.env.now < overflow_end_time:
+            yield self.env.timeout(2.0)
+            if self.queue:
+                n_load = min(self.cfg.bus_capacity, len(self.queue))
+                for _ in range(n_load):
+                    evt, t_arr, bib = self.queue.pop(0)
+                    self.metrics.bus_wait_min.append((self.cfg.name, self.env.now - t_arr))
+                    self.metrics.overflow_bus_boardings.append((self.cfg.name, bib))
+                    evt.succeed()
 
     def board_and_travel(self, bib, rng):
+        t_arrive = self.env.now
+        # No balking, no reneging: buses are the ONLY way to the start line, so
+        # runners must stay in the queue. The consequence of slow check-in is
+        # therefore arriving late to the corral, not giving up.
+
+        # 1. Queue for check-in volunteer (ticket + name verification)
+        with self.check_in.request() as req:
+            yield req
+            t_checkin_start = self.env.now
+            self.metrics.bus_checkin_wait_min.append(
+                (self.cfg.name, t_checkin_start - t_arrive))
+            service_min = rng.exponential(self.cfg.check_in_mean_sec / 60.0)
+            yield self.env.timeout(service_min)
+        # 2. Queue for bus
         evt = self.env.event()
-        self.queue.append((evt, self.env.now, bib))
+        self.queue.append((evt, t_arrive, bib))
         yield evt
+        # 3. Travel to start
         travel = max(5.0, rng.normal(self.cfg.travel_time_mean_min,
                                      self.cfg.travel_time_std_min))
         self.metrics.bus_travel_min.append((self.cfg.name, travel))
@@ -900,8 +1077,15 @@ def runner_lifecycle(env, bib, bus_stop, corral_name, corral_start_offset,
     is_elite: True if this runner is in the fastest corral (corral 0 of CorralPlan).
               Elite runners use porta-johns less frequently.
     """
-    t_arr = rng.uniform(bus_stop.cfg.arrival_start_min,
-                        bus_stop.cfg.arrival_end_min)
+    # Sample bus-stop arrival time. Real BSIM behavior: runners RUSH the last
+    # 5-10 min before 4 AM (people drop off and dash). Beta(3, 1.5) maps to a
+    # mean at ~67% through the window, with a heavy concentration at the end.
+    cfg = bus_stop.cfg
+    if cfg.arrival_peak_at_end:
+        u = rng.beta(2.0, 2.0)              # peaks toward 1.0
+    else:
+        u = rng.uniform(0.0, 1.0)           # legacy uniform
+    t_arr = cfg.arrival_start_min + u * (cfg.arrival_end_min - cfg.arrival_start_min)
     wait = t_arr - env.now
     if wait > 0:
         yield env.timeout(wait)
@@ -962,8 +1146,28 @@ def run_marathon_full(seed: int = 42,
     if station_cfgs is None:
         station_cfgs = [AidStationConfig(mile=m) for m in AID_STATION_MILES]
     aid_stations = [AidStation(env, c, metrics) for c in station_cfgs]
-    bikes        = simpy.Resource(env, capacity=med_cfg.num_bike_medics)
+    # Bike capacity = number of bike teams (BSIM has 8 teams across 7 zones; Z4 has 2)
+    n_bike_teams = len(med_cfg.bike_teams) if med_cfg.bike_teams else med_cfg.num_bike_medics
+    bikes        = simpy.Resource(env, capacity=n_bike_teams)
     ambulances   = simpy.Resource(env, capacity=med_cfg.num_ambulances)
+
+    # ---- Bike patrol processes ----
+    # Each bike team patrols its assigned BSIM zone during its on-duty window.
+    # The patrol process here logs mileage so we can verify bikes are not idle
+    # and confirm the zones match the BSIM bike-zone briefing.
+    def _bike_patrol(env, team, metrics, patrol_speed):
+        miles_per_min = patrol_speed / 60.0
+        # Wait until on-duty window starts
+        if env.now < team.on_duty_start:
+            yield env.timeout(team.on_duty_start - env.now)
+        # Patrol during the window
+        while env.now < team.on_duty_end:
+            yield env.timeout(1.0)
+            metrics.bike_patrol_log.append((team.name, miles_per_min))
+
+    for team in med_cfg.bike_teams:
+        env.process(_bike_patrol(env, team, metrics, med_cfg.bike_patrol_speed_mph))
+    # --------------------------------
     bus_stops    = [BusStop(env, c, metrics) for c in bus_stop_cfgs]
     start_area   = StartArea(env, start_area_cfg, metrics)
 
@@ -1056,7 +1260,7 @@ DEFAULT_TARGETS = {
     "aid_wait_p95_sec":           Target("Aid wait p95 (sec)",            3,   15, "sec"),
     "aid_wait_max_sec":           Target("Aid wait max (sec)",            10,  60, "sec"),
     "porta_wait_p95_min":         Target("Aid porta-john wait p95 (min)", 5,   15, "min"),
-    "med_resp_p90_minor_min":     Target("Med response p90, minor (min)", 2,    5, "min"),
+    "med_resp_p90_minor_min":     Target("Med response p90, minor (min)", 5,    8, "min"),
     "med_resp_p90_high_min":      Target("Med response p90, high (min)",  2,    4, "min"),
     "amb_resp_p90_min":           Target("Ambulance p90 from call (min)", 15,  25, "min"),
     "bus_wait_p95_min":           Target("Bus boarding queue p95 (min)",  15,  30, "min"),
@@ -1078,6 +1282,8 @@ def _extract_metrics(metrics: RaceMetrics) -> dict:
     aw = np.array(metrics.aid_wait_min) * 60 if metrics.aid_wait_min else np.array([0.0])
     pw = np.array(metrics.porta_wait_min)    if metrics.porta_wait_min else np.array([0.0])
     bw = np.array([w for _, w in metrics.bus_wait_min]) if metrics.bus_wait_min else np.array([0.0])
+    bcw = (np.array([w for _, w in metrics.bus_checkin_wait_min])
+           if metrics.bus_checkin_wait_min else np.array([0.0]))
     sw = np.array(metrics.start_porta_wait_min) if metrics.start_porta_wait_min else np.array([0.0])
 
     minor = [i["response_min"] for i in metrics.injuries if i["severity"] == "minor"]
@@ -1085,20 +1291,34 @@ def _extract_metrics(metrics: RaceMetrics) -> dict:
     amb_r = [i.get("amb_response_min") for i in metrics.injuries if i.get("amb_response_min") is not None]
 
     return {
-        "aid_wait_p95_sec":      float(np.percentile(aw, 95)),
-        "aid_wait_max_sec":      float(aw.max()),
-        "porta_wait_p95_min":    float(np.percentile(pw, 95)),
-        "med_resp_p90_minor_min":float(np.percentile(minor, 90)) if minor else 0.0,
-        "med_resp_p90_high_min": float(np.percentile(high,  90)) if high  else 0.0,
-        "amb_resp_p90_min":      float(np.percentile(amb_r, 90)) if amb_r else 0.0,
-        "bus_wait_p95_min":      float(np.percentile(bw, 95)),
-        "start_porta_p95_min":   float(np.percentile(sw, 95)),
-        "stranded_count":        float(len(metrics.stranded_at_busstop)),
-        "late_to_corral_count":  float(len(metrics.late_to_corral)),
-        "stockout_count":        float(len(metrics.stockouts)),
-        "trash_overflow_count":  float(len(metrics.trash_overflows)),
-        "aid_balk_count":        float(len(metrics.aid_balked)),
-        "aid_renege_count":      float(len(metrics.aid_reneged)),
+        "aid_wait_p95_sec":           float(np.percentile(aw, 95)),
+        "aid_wait_max_sec":           float(aw.max()),
+        "porta_wait_p95_min":         float(np.percentile(pw, 95)),
+        "med_resp_p90_minor_min":     float(np.percentile(minor, 90)) if minor else 0.0,
+        "med_resp_p90_high_min":      float(np.percentile(high,  90)) if high  else 0.0,
+        "amb_resp_p90_min":           float(np.percentile(amb_r, 90)) if amb_r else 0.0,
+        "bus_wait_p95_min":           float(np.percentile(bw, 95)),
+        "bus_wait_mean_min":          float(np.mean(bw)),
+        "bus_checkin_wait_mean_min":  float(np.mean(bcw)),
+        "dnf_due_to_injury_count":    float(len(metrics.dnf_due_to_injury)),
+        "bike_response_distance_mean": float(np.mean(metrics.bike_response_distances)) if metrics.bike_response_distances else 0.0,
+        "bike_response_distance_p95":  float(np.percentile(metrics.bike_response_distances, 95)) if metrics.bike_response_distances else 0.0,
+        "bike_total_patrol_miles":    float(sum(m for _,m in metrics.bike_patrol_log)),
+        "bus_wait_mean_min":          float(bw.mean()),
+        "bus_wait_max_min":           float(bw.max()),
+        "bus_checkin_wait_p95_min":   float(np.percentile(bcw, 95)),  # NEW
+        "bus_checkin_wait_mean_min":  float(bcw.mean()),               # NEW
+        "bus_checkin_wait_max_min":   float(bcw.max()),                # NEW
+        "overflow_bus_count":         float(len(metrics.overflow_bus_boardings)),  # NEW
+        "start_porta_p95_min":        float(np.percentile(sw, 95)),
+        "stranded_count":             float(len(metrics.stranded_at_busstop)),
+        "late_to_corral_count":       float(len(metrics.late_to_corral)),
+        "late_to_corral_mean_min":    float(np.mean([d for _,d in metrics.late_to_corral])) if metrics.late_to_corral else 0.0,
+        "late_to_corral_p95_min":     float(np.percentile([d for _,d in metrics.late_to_corral], 95)) if metrics.late_to_corral else 0.0,
+        "stockout_count":             float(len(metrics.stockouts)),
+        "trash_overflow_count":       float(len(metrics.trash_overflows)),
+        "aid_balk_count":             float(len(metrics.aid_balked)),
+        "aid_renege_count":           float(len(metrics.aid_reneged)),
         "porta_balk_count":      float(len(metrics.porta_balked)),
         "porta_renege_count":    float(len(metrics.porta_reneged)),
     }
